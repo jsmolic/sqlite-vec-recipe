@@ -1,0 +1,109 @@
+schema_version: 1
+
+context:
+  version: "0.1.9"
+
+recipe:
+  name: sqlite-vec
+  version: ${{ version }}
+
+source:
+  url: https://github.com/asg017/sqlite-vec/archive/refs/tags/v${{ version }}.tar.gz
+  sha256: 9823e737d9934dcbe85dff75d3fca81018a9beee803d70fa77b16faab5d61dc9
+  patches:
+    - 0001-Add-wheel-build-support-to-the-python-bindings.patch
+
+build:
+  number: 0
+
+outputs:
+  - staging:
+      name: sqlite-vec-build
+    requirements:
+      build:
+        - ${{ compiler('c') }}
+        - if: unix
+          then: make
+        - if: win
+          then:
+            - m2-bash
+            - m2-coreutils
+      host:
+        - sqlite
+        - python >=3.9
+        - pip
+        - setuptools >=77
+      # SQLite extensions use the loader's API table, not a linked libsqlite.
+      ignore_run_exports:
+        by_name:
+          - libsqlite
+
+  - package:
+      name: libsqlite-vec
+    inherit: sqlite-vec-build
+    build:
+      files:
+        - lib/sqlite-vec/**
+        - Library/lib/sqlite-vec/**
+    requirements:
+      ignore_run_exports:
+        by_name:
+          - python_abi
+    tests:
+      - script:
+          - if: win
+            then: >-
+              "%LIBRARY_BIN%\sqlite3.exe" -bail :memory:
+              "SELECT load_extension('%LIBRARY_LIB%\sqlite-vec\vec0.dll'); SELECT vec_version();"
+            else: >-
+              "${PREFIX}/bin/sqlite3" -bail :memory:
+              "SELECT load_extension('${PREFIX}/lib/sqlite-vec/vec0.so'); SELECT vec_version();"
+        requirements:
+          run:
+            - sqlite
+    about:
+      summary: SQLite loadable extension for vector search
+
+  - package:
+      name: sqlite-vec
+    inherit:
+      from: sqlite-vec-build
+      run_exports: false
+    build:
+      noarch: python
+      files:
+        - lib/python*/site-packages/sqlite_vec/**
+        - lib/python*/site-packages/sqlite_vec-*.dist-info/**
+        - Lib/site-packages/sqlite_vec/**
+        - Lib/site-packages/sqlite_vec-*.dist-info/**
+    requirements:
+      host:
+        - python >=3.9
+      run:
+        - python >=3.9
+        - ${{ pin_subpackage('libsqlite-vec', upper_bound='x.x.x') }}
+    tests:
+      - script: python -I -m pytest -q --import-mode=importlib bindings/python/test_package.py
+        files:
+          source:
+            - bindings/python/test_package.py
+            - VERSION
+        requirements:
+          run:
+            - pytest
+    about:
+      summary: Python bindings for the sqlite-vec extension
+
+about:
+  homepage: https://github.com/asg017/sqlite-vec
+  summary: SQLite extension for vector search
+  description: |
+    sqlite-vec is a SQLite loadable extension providing vector search
+    functionality through the vec0 virtual table and vec_* SQL functions.
+  license: MIT OR Apache-2.0
+  repository: https://github.com/asg017/sqlite-vec
+  documentation: https://alexgarcia.xyz/sqlite-vec/
+
+extra:
+  recipe-maintainers:
+    - jsmolic

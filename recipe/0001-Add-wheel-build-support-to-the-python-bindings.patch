@@ -1,0 +1,250 @@
+From 3303a9a6c7a96a6228ad49ba22e84a7b79d9f369 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jakov=20Smoli=C4=87?= <jsmolic@quansight.com>
+Date: Wed, 23 Sep 2026 16:33:00 +0400
+Subject: [PATCH] Add wheel build support to the python bindings
+
+---
+ Makefile                        |  8 +++-
+ bindings/python/__init__.py.in  | 22 +++++++++
+ bindings/python/build.sh        | 81 +++++++++++++++++++++++++++++++++
+ bindings/python/pyproject.toml  | 27 +++++++++++
+ bindings/python/test_package.py | 35 ++++++++++++++
+ 5 files changed, 171 insertions(+), 2 deletions(-)
+ create mode 100644 bindings/python/__init__.py.in
+ create mode 100644 bindings/python/build.sh
+ create mode 100644 bindings/python/pyproject.toml
+ create mode 100644 bindings/python/test_package.py
+
+diff --git a/Makefile b/Makefile
+index 175ab16..35e250c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -6,6 +6,7 @@ DATE=$(shell date +'%FT%TZ%z')
+ INSTALL_LIB_DIR = /usr/local/lib
+ INSTALL_INCLUDE_DIR = /usr/local/include
+ INSTALL_BIN_DIR = /usr/local/bin
++PYTHON ?= python3
+ 
+ ifndef CC
+ CC=gcc
+@@ -73,6 +74,8 @@ TARGET_STATIC_H=$(prefix)/sqlite-vec.h
+ TARGET_CLI=$(prefix)/sqlite3
+ 
+ loadable: $(TARGET_LOADABLE)
++python:
++	PYTHON="$(PYTHON)" bash bindings/python/build.sh
+ static: $(TARGET_STATIC)
+ cli: $(TARGET_CLI)
+ 
+@@ -98,8 +101,9 @@ $(TARGET_LOADABLE): sqlite-vec.c sqlite-vec.h $(prefix)
+ 		-Wall -Wextra \
+ 		-Ivendor/ \
+ 		-O3 \
++		$(CPPFLAGS) \
+ 		$(CFLAGS) \
+-		$< -o $@
++		$< -o $@ $(LDFLAGS) $(LDLIBS)
+ 
+ $(TARGET_STATIC): sqlite-vec.c sqlite-vec.h $(prefix) $(OBJS_DIR)
+ 	$(CC) -Ivendor/ $(CFLAGS) -DSQLITE_CORE -DSQLITE_VEC_STATIC \
+@@ -188,7 +192,7 @@ evidence-of:
+ test:
+ 	sqlite3 :memory: '.read test.sql'
+ 
+-.PHONY: version loadable static test clean gh-release evidence-of install uninstall
++.PHONY: version loadable python static test clean gh-release evidence-of install uninstall
+ 
+ publish-release:
+ 	./scripts/publish-release.sh
+diff --git a/bindings/python/__init__.py.in b/bindings/python/__init__.py.in
+new file mode 100644
+index 0000000..0e44aca
+--- /dev/null
++++ b/bindings/python/__init__.py.in
+@@ -0,0 +1,22 @@
++
++from os import path
++import sqlite3
++import sys
++
++__version__ = "@VERSION@"
++__version_info__ = tuple(__version__.split("."))
++
++def loadable_path():
++  """Return the bundled extension, or the separately installed shared library."""
++
++  loadable_path = path.join(path.dirname(__file__), "vec0")
++  if any(path.isfile(loadable_path + suffix) for suffix in (".so", ".dylib", ".dll")):
++    return path.normpath(loadable_path)
++  if sys.platform == "win32":
++    return path.join(sys.prefix, "Library", "lib", "sqlite-vec", "vec0.dll")
++  return path.join(sys.prefix, "lib", "sqlite-vec", "vec0.so")
++
++def load(conn: sqlite3.Connection)  -> None:
++  """ Load the sqlite-vec SQLite extension into the given database connection. """
++
++  conn.load_extension(loadable_path())
+diff --git a/bindings/python/build.sh b/bindings/python/build.sh
+new file mode 100644
+index 0000000..e8170f7
+--- /dev/null
++++ b/bindings/python/build.sh
+@@ -0,0 +1,81 @@
++#!/usr/bin/env bash
++set -euxo pipefail
++
++cd "$(dirname "${BASH_SOURCE[0]}")/../.."
++PYTHON="${PYTHON:-python3}"
++SQLITE_VEC_BUNDLE="${SQLITE_VEC_BUNDLE:-1}"
++case "${SQLITE_VEC_BUNDLE}" in
++    0|1) ;;
++    *) echo "SQLITE_VEC_BUNDLE must be 0 or 1" >&2; exit 1 ;;
++esac
++
++case "$(uname -s)" in
++    MINGW*|MSYS*|CYGWIN*)
++        platform=windows
++        PYTHON="$(cygpath -u "${PYTHON}")"
++        extension=dll
++        ;;
++    Darwin) platform=macos; extension=dylib ;;
++    *) platform=unix; extension=so ;;
++esac
++
++# Release archives lack Git metadata and should not require envsubst or BSD date.
++"${PYTHON}" - <<'PY'
++from datetime import datetime, timezone
++from pathlib import Path
++import shutil
++from string import Template
++import subprocess
++
++version_file = Path("VERSION")
++version = version_file.read_text().strip()
++major, minor, patch = version.split(".", 2)
++try:
++    source = subprocess.check_output(
++        ["git", "log", "-n", "1", "--pretty=format:%H", "--", "VERSION"],
++        stderr=subprocess.DEVNULL, text=True,
++    ).strip()
++except (OSError, subprocess.CalledProcessError):
++    source = ""
++header = Template(Path("sqlite-vec.h.tmpl").read_text()).substitute(
++    VERSION=version, VERSION_MAJOR=major, VERSION_MINOR=minor,
++    VERSION_PATCH=patch.split("-", 1)[0],
++    DATE=datetime.fromtimestamp(version_file.stat().st_mtime, timezone.utc).isoformat(),
++    SOURCE=source,
++)
++Path("sqlite-vec.h").write_text(header, encoding="utf-8")
++
++bindings = Path("bindings/python")
++package = bindings / "sqlite_vec"
++package.mkdir(parents=True, exist_ok=True)
++loader = (bindings / "__init__.py.in").read_text().replace("@VERSION@", version)
++helpers = (bindings / "extra_init.py").read_text()
++(package / "__init__.py").write_text(loader + helpers, encoding="utf-8")
++for name in ("LICENSE-MIT", "LICENSE-APACHE"):
++    shutil.copyfile(name, bindings / name)
++# Avoid packaging binaries left over from another target or build.
++for pattern in ("vec0.so", "vec0.dylib", "vec0.dll"):
++    (package / pattern).unlink(missing_ok=True)
++shutil.rmtree(bindings / "build", ignore_errors=True)
++PY
++
++if [[ "${platform}" == windows ]]; then
++    mkdir -p dist
++    include_dir="${SQLITE_INCLUDE_DIR:-vendor}"
++    include_dir="$(cygpath -m "${include_dir}")"
++    MSYS2_ARG_CONV_EXCL='*' cl.exe /nologo /O2 /MD /LD "/I${include_dir}" sqlite-vec.c /Fe:dist/vec0.dll
++else
++    if [[ -n "${SQLITE_INCLUDE_DIR:-}" ]]; then
++        export CPPFLAGS="${CPPFLAGS:-} -I\"${SQLITE_INCLUDE_DIR}\""
++    fi
++    if [[ "${platform}" == macos ]]; then
++        export LDFLAGS="${LDFLAGS:-} -Wl,-install_name,@rpath/vec0.dylib"
++    fi
++    # Build portable wheels by default; opt in to the upstream SIMD flags explicitly.
++    OMIT_SIMD="${OMIT_SIMD:-1}" make -W sqlite-vec.c loadable
++fi
++
++if [[ "${SQLITE_VEC_BUNDLE}" == 1 ]]; then
++    cp "dist/vec0.${extension}" "bindings/python/sqlite_vec/vec0.${extension}"
++fi
++"${PYTHON}" -m pip wheel ./bindings/python --no-deps --wheel-dir dist "$@"
+diff --git a/bindings/python/pyproject.toml b/bindings/python/pyproject.toml
+new file mode 100644
+index 0000000..fced354
+--- /dev/null
++++ b/bindings/python/pyproject.toml
+@@ -0,0 +1,27 @@
++[build-system]
++requires = ["setuptools>=77"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "sqlite-vec"
++dynamic = ["version"]
++description = "SQLite vector search extension and Python bindings"
++requires-python = ">=3.9"
++dependencies = []
++license = "MIT OR Apache-2.0"
++license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
++
++[project.optional-dependencies]
++test = ["pytest"]
++
++[project.urls]
++Homepage = "https://github.com/asg017/sqlite-vec"
++
++[tool.setuptools]
++packages = ["sqlite_vec"]
++
++[tool.setuptools.dynamic]
++version = {attr = "sqlite_vec.__version__"}
++
++[tool.setuptools.package-data]
++sqlite_vec = ["vec0.so", "vec0.dylib", "vec0.dll"]
+diff --git a/bindings/python/test_package.py b/bindings/python/test_package.py
+new file mode 100644
+index 0000000..ad023bc
+--- /dev/null
++++ b/bindings/python/test_package.py
+@@ -0,0 +1,35 @@
++import sqlite3
++from importlib.metadata import distribution
++from pathlib import Path
++import sys
++
++import pytest
++
++import sqlite_vec
++
++
++@pytest.fixture
++def db():
++    connection = sqlite3.connect(":memory:")
++    try:
++        connection.enable_load_extension(True)
++        sqlite_vec.load(connection)
++        connection.enable_load_extension(False)
++        yield connection
++    finally:
++        connection.close()
++
++
++def test_version():
++    version = (Path(__file__).resolve().parents[2] / "VERSION").read_text().strip()
++    assert sqlite_vec.__version__ == version
++    assert sqlite_vec.__version_info__ == tuple(version.split("."))
++
++def test_extension_loading(db):
++    assert db.execute("SELECT vec_version()").fetchone()[0] == "v" + sqlite_vec.__version__
++
++def test_vector_search(db):
++    vector = sqlite_vec.serialize_float32([1.0, 2.0, 3.0])
++    db.execute("CREATE VIRTUAL TABLE vectors USING vec0(embedding float[3])")
++    db.execute("INSERT INTO vectors(rowid, embedding) VALUES (1, ?)", [vector])
++    assert db.execute("SELECT rowid FROM vectors WHERE embedding MATCH ? AND k = 1", [vector]).fetchone() == (1,)
+-- 
+2.51.0
+
